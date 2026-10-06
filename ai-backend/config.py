@@ -1,12 +1,17 @@
 import os
 from typing import Optional
+from dotenv import load_dotenv
+
+load_dotenv()  # must run before Config reads env vars
 
 # basic config for the AI backend
 class Config:
 
     # ollama settings
-    OLLAMA_URL: str = os.getenv('OLLAMA_URL', 'http://localhost:11434')
-    OLLAMA_MODEL: str = os.getenv('OLLAMA_MODEL', 'llama3:latest')  # default model
+    OLLAMA_URL: str = os.getenv('OLLAMA_URL', 'https://ollama.com')
+    OLLAMA_MODEL: str = os.getenv('OLLAMA_MODEL', 'gpt-oss:120b')  # default model
+    OLLAMA_API_KEY: str = os.getenv('OLLAMA_API_KEY', '')  # needed for ollama.com cloud
+    OLLAMA_HEADERS: dict = {'Authorization': f'Bearer {OLLAMA_API_KEY}'} if OLLAMA_API_KEY else {}
     OLLAMA_TIMEOUT: int = int(os.getenv('OLLAMA_TIMEOUT', '60'))  # 60 sec timeout
 
     # server config
@@ -41,7 +46,7 @@ class Config:
         """Validate Ollama connection"""
         try:
             import requests
-            response = requests.get(f"{cls.OLLAMA_URL}/api/tags", timeout=5)
+            response = requests.get(f"{cls.OLLAMA_URL}/api/tags", headers=cls.OLLAMA_HEADERS, timeout=5)
             if response.status_code == 200:
                 models = response.json().get('models', [])
                 model_names = [model['name'] for model in models]

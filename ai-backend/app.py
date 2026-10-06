@@ -183,7 +183,7 @@ class DashboardGenerator:
                 }
             }
             print(f"Calling LLM with model: {Config.OLLAMA_MODEL}")
-            response = requests.post(self.ollama_url, json=payload, timeout=Config.OLLAMA_TIMEOUT)
+            response = requests.post(self.ollama_url, json=payload, headers=Config.OLLAMA_HEADERS, timeout=Config.OLLAMA_TIMEOUT)
 
             if response.status_code == 200:
                 result = response.json().get('response', '')
