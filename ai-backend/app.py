@@ -9,6 +9,8 @@ import json
 import threading
 from datetime import datetime
 import signal
+import socket
+import sys
 import requests
 from dotenv import load_dotenv
 from config import Config
@@ -162,7 +164,7 @@ class DashboardGenerator:
                 )
             if 'ScheduledDate_parsed' in processed_df.columns:
                 processed_df['Date'] = processed_df['ScheduledDate_parsed'].dt.date
-                processed_df['Month'] = processed_df['ScheduledDate_parsed'].dt.to_period('M')
+                processed_df['Month'] = processed_df['ScheduledDate_parsed'].dt.to_period('M').astype(str)  # sqlite can't store Period
 
             return processed_df
 
@@ -304,7 +306,7 @@ ACTUAL DATA CONTEXT:
 - Data Type: {data_context.get('data_type', 'shipment_logistics')}
 - Total Rows: {data_context.get('total_rows', 'Unknown')}
 - Available Columns: {', '.join(data_context['columns'])}
-- Sample Data (first 5 rows): {json.dumps(data_context['sample_data'], indent=2)}
+- Sample Data (first 5 rows): {json.dumps(data_context['sample_data'], indent=2, default=str)}
 - Source file: {data_context.get('excel_source', 'Excel file')} (for reference only - do not use for table names)
 
 IMPORTANT:
@@ -1734,19 +1736,24 @@ st.dataframe(df, use_container_width=True)
     def start_streamlit_dashboard(self, filepath, port):
         try:
             cmd = [
-                'streamlit', 'run', filepath,
+                sys.executable, '-m', 'streamlit', 'run', filepath,  # venv's streamlit, not whatever is on PATH
                 '--server.port', str(port),
                 '--server.headless', 'true',
                 '--server.enableCORS', 'false',
-                '--server.enableXsrfProtection', 'false'
+                '--server.enableXsrfProtection', 'false',
+                '--browser.gatherUsageStats', 'false'
             ]
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=Config.DASHBOARD_DIR
-            )
-            time.sleep(3)
+            log = open(os.path.join(Config.LOGS_DIR, f"{os.path.basename(filepath)}.log"), 'w')
+            process = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=Config.DASHBOARD_DIR)
+            # wait until streamlit actually accepts connections, otherwise the iframe gets "refused to connect"
+            for _ in range(60):
+                if process.poll() is not None:
+                    print(f"Streamlit exited early, see {log.name}")
+                    return None
+                with socket.socket() as s:
+                    if s.connect_ex(('localhost', port)) == 0:
+                        return process
+                time.sleep(0.5)
             return process
         except Exception as e:
             print(f"Error starting Streamlit: {e}")
@@ -1776,16 +1783,46 @@ def get_config():
 @app.route('/api/dashboard/generate', methods=['POST'])
 def generate_dashboard():
     try:
-        data = request.get_json()
+        data = request.get_json() or {}
         user_prompt = data.get('prompt', '')
         excel_path = data.get('excel_path', '')
         if not user_prompt:
             return jsonify({'error': 'Prompt is required'}), 400
         print(f"Generating dashboard for: '{user_prompt}'")
-        print("AI processing complete")  # TODO: actually process with LLM
-        # quick hack for demo - just return fixed URL
-        dashboard_id = f"{int(time.time())}_{hash(user_prompt) % 10000}"
-        dashboard_url = "http://localhost:8520"  # hardcoded for now
+
+        # data source: uploaded file > inline rows > newest file in excel-data/
+        if not excel_path and data.get('data'):
+            excel_path = os.path.join(generator.excel_dir, f"upload_{int(time.time())}.xlsx")
+            pd.DataFrame(data['data']).to_excel(excel_path, index=False)
+        if not excel_path:
+            files = generator.find_excel_files()
+            if not files:
+                return jsonify({'error': 'No Excel data provided'}), 400
+            excel_path = files[0]
+        data_context = generator.convert_excel_to_sqlite(excel_path)
+        if not data_context['success']:
+            return jsonify({'error': f"Failed to load Excel: {data_context['error']}"}), 400
+
+        code = generator.generate_dashboard_code(user_prompt, data_context)
+        try:
+            compile(code, '<dashboard>', 'exec')
+        except SyntaxError as e:
+            print(f"LLM code has a syntax error ({e}), using template")
+            code = generator.get_fallback_dashboard(data_context, generator.analyze_dashboard_type(user_prompt))
+
+        dashboard_id = f"{int(time.time())}_{abs(hash(user_prompt)) % 10000}"
+        with socket.socket() as s:
+            s.bind(('localhost', 0))
+            port = s.getsockname()[1]
+        filepath = generator.create_dashboard_file(code, dashboard_id)
+        process = generator.start_streamlit_dashboard(filepath, port)
+        if not process:
+            return jsonify({'error': 'Dashboard server failed to start'}), 500
+        running_dashboards[dashboard_id] = {
+            'process': process, 'port': port, 'prompt': user_prompt,
+            'created_at': datetime.now().isoformat()
+        }
+        dashboard_url = f"http://localhost:{port}"
         return jsonify({
             'success': True,
             'dashboard_id': dashboard_id,
